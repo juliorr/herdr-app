@@ -106,7 +106,9 @@ fn fixture(populated: bool, props: Value, update: Value) -> BTreeMap<String, Val
     values
 }
 
-fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostModule {
+fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostModule {
+    // What `ls` finds in the app folder's space-icons/ (none: the folder is missing).
+    let icons = values.remove("space-icons");
     let mut module = HostModule::new("herdr");
     for (name, value) in values {
         module = module.function(name, move |_| Ok(to_host(&value)));
@@ -156,6 +158,7 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     }
     for name in ["exec", "hc", "readTextFile", "writeTextFile", "sendFeedback"] {
         let calls = calls.clone();
+        let icons = icons.clone();
         module = module.async_function(name, move |a| {
             let first = a.get(0).map(from_host).unwrap_or(Value::Null);
             let reply = match name {
@@ -176,6 +179,10 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 "exec" if first == "sh" && a.get(1).map(from_host).and_then(|v| v.get(2).cloned()) == Some(json!("files")) => {
                     Some(json!({"code":0,"stdout":"d\u{0}src\u{0}f\u{0}README.md\u{0}","stderr":""}))
                 }
+                "exec" if first == "ls" && a.get(1).map(from_host) == Some(json!(["-1", "/fixture/app/space-icons"])) => Some(match &icons {
+                    Some(listing) => json!({"code":0,"stdout":listing,"stderr":""}),
+                    None => json!({"code":1,"stdout":"","stderr":"ls: /fixture/app/space-icons: No such file or directory"}),
+                }),
                 "exec"
                     if first == "git"
                         && [
@@ -338,6 +345,52 @@ fn windows_tab_buttons_use_matching_vector_icons(cx: &mut TestAppContext) {
             } else {
                 assert!(!tree.contains("mods/tabs/win-"), "{tree}");
                 assert!(tree.contains("mods/pane/close.svg"), "{tree}");
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn spaces_draw_an_image_named_after_their_repo(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    // The fixture's local space is not a repo: its folder's name stands in.
+    for (listing, icon) in [
+        (Some("other.png\nProject.jpg\nproject.PNG\nproject.txt\n"), Some("space-icons/project.PNG")),
+        (Some("Project.svg\n"), Some("space-icons/Project.svg")),
+        (Some("other.png\nproject.txt\n"), None),
+        (None, None),
+    ] {
+        let mut values = fixture(true, props(), updates("current", "current"));
+        if let Some(listing) = listing {
+            values.insert("space-icons".into(), json!(listing));
+        }
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let policy = Policy::new()
+            .with_storage_path(staged.0.join(format!("store-icons-{}.json", icon.unwrap_or("none").replace('/', "-"))))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(values, calls.clone()))
+            .unwrap();
+        let window = cx.add_window(|_, _| Empty);
+        let mut session = window.update(cx, |_, window, cx| {
+            DescriptionSession::load(ShellRuntime::new_isolated().unwrap(), staged.0.join("mods/spaces"), policy, window, cx).unwrap()
+        }).unwrap();
+        cx.run_until_parked();
+        let tree = window.update(cx, |_, window, cx| {
+            let tree = session.describe(window, cx).unwrap();
+            window.remove_window();
+            tree
+        }).unwrap();
+        assert!(calls.borrow().unexpected.is_empty(), "{:?}", calls.borrow().unexpected);
+        let row = tree.lines().skip_while(|l| !l.contains("space-s1")).take(4).collect::<Vec<_>>().join("\n");
+        match icon {
+            Some(icon) => {
+                assert!(row.contains(icon), "{listing:?}: {tree}");
+                assert!(!row.contains("\"L\""), "the image replaces the letter: {tree}");
+            }
+            None => {
+                assert!(!tree.contains("space-icons/"), "{listing:?}: {tree}");
+                assert!(row.contains("\"L\""), "the letter stays: {tree}");
             }
         }
     }
